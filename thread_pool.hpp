@@ -14,6 +14,12 @@
 namespace coro
 {
 
+struct executor_t {
+    constexpr executor_t() noexcept = default;
+};
+
+inline executor_t executor;
+
 template <class T, class V>
 concept range_of = std::ranges::range<T> && std::same_as<std::ranges::range_value_t<T>, V>;
 

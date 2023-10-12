@@ -1,11 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <span>
 #include <vector>
+#include <print>
 #include "task.hpp"
-#include <thread>
 
 struct abstract_task_node {
     virtual auto task_name() -> std::string = 0;
@@ -13,7 +14,147 @@ struct abstract_task_node {
     virtual auto predecessors() -> std::span<std::shared_ptr<abstract_task_node>> = 0;
     auto schedule() -> coro::task<>;
     virtual ~abstract_task_node() = default;
+
+private:
+    enum class node_state {
+        init,
+        scheduled,
+        running,
+        completed,
+    };
+
+    std::atomic<node_state> m_state{node_state::init};
+    std::atomic<void*> m_awaiting_list{nullptr};
+
+    struct schedule_awaitable {
+        auto await_ready() const noexcept -> bool { return false; }
+        auto await_suspend(std::coroutine_handle<> awaiting_coroutine) -> bool {
+            // check whether the task is already scheduled
+            auto expected = node_state::init;
+            bool success = self_.m_state.compare_exchange_strong(expected, node_state::scheduled, std::memory_order_relaxed);
+            schedule_task task;
+            if (success) {
+                // if the task was not scheduled, schedule it
+                // to schedule the task we need to resume the coroutine
+                // inside the coroutine, the task may or may not schedule itself to other executor
+                task = self_.on_schedule();
+                task.start();
+            }
+            // check whether the task is already completed
+            // the address of task node in m_awaiting_list represents for the completion of the task
+            const void* completed = std::addressof(self_);
+            m_awaiting_coroutine = awaiting_coroutine;
+
+            // try to atomicly push the awaiter to the awaiting list
+            void* old_value = self_.m_awaiting_list.load(std::memory_order_relaxed);
+            do {
+                if (old_value == completed) {
+                    // the task is already completed
+                    // resume the awaiting coroutine
+                    // returning false means resume the suspended coroutine immediately
+                    return false;
+                }
+                // not completed, the old value is a pointer to an awaiter
+                // locally push this to head of the list
+                m_next = static_cast<schedule_awaitable*>(old_value);
+                
+                // try to publish the local list until success
+            } while (!self_.m_awaiting_list.compare_exchange_weak(old_value, this, std::memory_order_release, std::memory_order_acquire));
+
+            // successfully add this to waiting list, remain suspended
+            return true;
+        }
+        auto await_resume() noexcept -> void {}
+
+        abstract_task_node& self_;
+        std::coroutine_handle<> m_awaiting_coroutine;
+        schedule_awaitable* m_next;
+    };
+
+    auto try_schedule_self() -> schedule_awaitable {
+        return schedule_awaitable{*this};
+    }
+
+    struct schedule_task {
+        struct task_promise_type {
+            using coroutine_handle = std::coroutine_handle<task_promise_type>;
+
+            task_promise_type(abstract_task_node& task): self_(task) {}
+
+            auto initial_suspend() noexcept  { return std::suspend_always{}; }
+            schedule_task get_return_object();
+
+            struct final_awaitable {
+                auto await_ready() const noexcept { return false; }
+                auto await_suspend(coroutine_handle awaiting_coroutine) noexcept {
+                    auto& self = awaiting_coroutine.promise().self_;
+                    void* old_value = self.m_awaiting_list.exchange(&self, std::memory_order_acq_rel);
+                    auto waiters = static_cast<schedule_awaitable*>(old_value);
+                    while (waiters != nullptr) {
+                        auto next = waiters->m_next;
+                        waiters->m_awaiting_coroutine.resume();
+                        waiters = next;
+                    }
+                }
+                auto await_resume() const noexcept {};
+            };
+
+            auto final_suspend() noexcept { return final_awaitable{}; }
+            auto unhandled_exception() noexcept {
+                m_exception_ptr = std::current_exception();
+            }
+
+            auto return_void() {
+                if (m_exception_ptr) {
+                    std::rethrow_exception(m_exception_ptr);
+                }
+            }
+
+            abstract_task_node& self_;
+            std::exception_ptr m_exception_ptr;
+        };
+        using promise_type = task_promise_type;
+        using coroutine_handle = promise_type::coroutine_handle;
+
+        schedule_task(): m_coroutine(nullptr) {}
+        schedule_task(coroutine_handle handle): m_coroutine(handle) {}
+        schedule_task(const schedule_task&) = delete;
+        schedule_task(schedule_task&& other) noexcept : m_coroutine(std::exchange(other.m_coroutine, nullptr)) {}
+        schedule_task& operator=(const schedule_task& rhs) = delete;
+        schedule_task& operator=(schedule_task&& rhs) noexcept {
+            if (this != std::addressof(rhs)) {
+                if (m_coroutine != nullptr) {
+                    m_coroutine.destroy();
+                }
+
+                m_coroutine = std::exchange(rhs.m_coroutine, nullptr);
+            }
+            return *this;
+        }
+        ~schedule_task() {
+            if (m_coroutine != nullptr) {
+                m_coroutine.destroy();
+            }
+        }
+
+        auto start() -> void {
+            auto& promise = m_coroutine.promise();
+            if (m_coroutine != nullptr) {
+                m_coroutine.resume();
+            }
+        }
+
+        coroutine_handle m_coroutine;
+    };
+
+    auto on_schedule() -> schedule_task {
+        co_await task();
+    }
 };
+
+abstract_task_node::schedule_task abstract_task_node::schedule_task::task_promise_type::get_return_object() {
+    return std::coroutine_handle<task_promise_type>::from_promise(*this);
+}
 
 namespace coro {
 
@@ -23,19 +164,19 @@ struct void_value {};
 
 struct when_all_latch {
 public:
-    when_all_latch(std::size_t count): m_count(count) {}
+    when_all_latch(std::size_t count): m_count(count + 1) {}
     when_all_latch(const when_all_latch&) = delete;
     when_all_latch(when_all_latch&&) = delete;
     auto operator=(const when_all_latch&) -> when_all_latch& = delete;
     auto operator=(when_all_latch&&) -> when_all_latch& = delete;
 
-    auto is_ready() const noexcept -> bool { return m_awaiting_coroutine == nullptr || m_awaiting_coroutine.done(); }
+    auto is_ready() const noexcept -> bool { return m_awaiting_coroutine != nullptr && m_awaiting_coroutine.done(); }
     auto try_await(std::coroutine_handle<> awaiting_coroutine) -> bool {
         m_awaiting_coroutine = awaiting_coroutine;
-        return m_count.fetch_sub(1, std::memory_order_acq_rel) > 0;
+        return m_count.fetch_sub(1, std::memory_order_acquire) > 1;
     }
     auto notify_awaitable_completed() noexcept -> void {
-        if (m_count.fetch_sub(1, std::memory_order_acq_rel) == 0) {
+        if (m_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             if (m_awaiting_coroutine != nullptr) {
                 m_awaiting_coroutine.resume();
             }
@@ -52,104 +193,6 @@ class when_all_ready_awaitable;
 
 template<typename return_type>
 class when_all_task;
-
-/// Empty tuple<> implementation.
-template<>
-class when_all_ready_awaitable<std::tuple<>>
-{
-public:
-    constexpr when_all_ready_awaitable() noexcept {}
-    explicit constexpr when_all_ready_awaitable(std::tuple<>) noexcept {}
-
-    constexpr auto await_ready() const noexcept -> bool { return true; }
-    auto           await_suspend(std::coroutine_handle<>) noexcept -> void {}
-    auto           await_resume() const noexcept -> std::tuple<> { return {}; }
-};
-
-template<typename... task_types>
-class when_all_ready_awaitable<std::tuple<task_types...>>
-{
-public:
-    explicit when_all_ready_awaitable(task_types&&... tasks) noexcept(
-        std::conjunction<std::is_nothrow_move_constructible<task_types>...>::value)
-        : m_latch(sizeof...(task_types)),
-          m_tasks(std::move(tasks)...)
-    {
-    }
-
-    explicit when_all_ready_awaitable(std::tuple<task_types...>&& tasks) noexcept(
-        std::is_nothrow_move_constructible_v<std::tuple<task_types...>>)
-        : m_latch(sizeof...(task_types)),
-          m_tasks(std::move(tasks))
-    {
-    }
-
-    when_all_ready_awaitable(const when_all_ready_awaitable&) = delete;
-    when_all_ready_awaitable(when_all_ready_awaitable&& other)
-        : m_latch(std::move(other.m_latch)),
-          m_tasks(std::move(other.m_tasks))
-    {
-    }
-
-    auto operator=(const when_all_ready_awaitable&) -> when_all_ready_awaitable& = delete;
-    auto operator=(when_all_ready_awaitable&&) -> when_all_ready_awaitable&      = delete;
-
-    auto operator co_await() & noexcept
-    {
-        struct awaiter
-        {
-            explicit awaiter(when_all_ready_awaitable& awaitable) noexcept : m_awaitable(awaitable) {}
-
-            auto await_ready() const noexcept -> bool { return m_awaitable.is_ready(); }
-
-            auto await_suspend(std::coroutine_handle<> awaiting_coroutine) noexcept -> bool
-            {
-                return m_awaitable.try_await(awaiting_coroutine);
-            }
-
-            auto await_resume() noexcept -> std::tuple<task_types...>& { return m_awaitable.m_tasks; }
-
-        private:
-            when_all_ready_awaitable& m_awaitable;
-        };
-
-        return awaiter{*this};
-    }
-
-    auto operator co_await() && noexcept
-    {
-        struct awaiter
-        {
-            explicit awaiter(when_all_ready_awaitable& awaitable) noexcept : m_awaitable(awaitable) {}
-
-            auto await_ready() const noexcept -> bool { return m_awaitable.is_ready(); }
-
-            auto await_suspend(std::coroutine_handle<> awaiting_coroutine) noexcept -> bool
-            {
-                return m_awaitable.try_await(awaiting_coroutine);
-            }
-
-            auto await_resume() noexcept -> std::tuple<task_types...>&& { return std::move(m_awaitable.m_tasks); }
-
-        private:
-            when_all_ready_awaitable& m_awaitable;
-        };
-
-        return awaiter{*this};
-    }
-
-private:
-    auto is_ready() const noexcept -> bool { return m_latch.is_ready(); }
-
-    auto try_await(std::coroutine_handle<> awaiting_coroutine) noexcept -> bool
-    {
-        std::apply([this](auto&&... tasks) { ((tasks.start(m_latch)), ...); }, m_tasks);
-        return m_latch.try_await(awaiting_coroutine);
-    }
-
-    when_all_latch            m_latch;
-    std::tuple<task_types...> m_tasks;
-};
 
 template<typename task_container_type>
 class when_all_ready_awaitable
@@ -423,47 +466,26 @@ private:
     coroutine_handle_type m_coroutine;
 };
 
-template<
-    concepts::awaitable awaitable,
-    typename return_type = typename concepts::awaitable_traits<awaitable&&>::awaiter_return_type>
-static auto make_when_all_task(awaitable a) -> when_all_task<return_type> __attribute__((used));
-
-template<concepts::awaitable awaitable, typename return_type>
-static auto make_when_all_task(awaitable a) -> when_all_task<return_type>
+inline auto make_when_all_task(task<>& awaitable) -> when_all_task<void>
 {
-    if constexpr (std::is_void_v<return_type>)
-    {
-        co_await static_cast<awaitable&&>(a);
-        co_return;
-    }
-    else
-    {
-        co_yield co_await static_cast<awaitable&&>(a);
-    }
+    co_await awaitable;
+    co_return;
 }
 
 } // namespace detail
 
-template<concepts::awaitable... awaitables_type>
-[[nodiscard]] auto when_all(awaitables_type... awaitables)
-{
-    return detail::when_all_ready_awaitable<std::tuple<
-        detail::when_all_task<typename concepts::awaitable_traits<awaitables_type>::awaiter_return_type>...>>(
-        std::make_tuple(detail::make_when_all_task(std::move(awaitables))...));
-}
-
-[[nodiscard]] auto when_all(std::span<std::reference_wrapper<task<>>> awaitables)
+[[nodiscard]] auto when_all(std::span<task<>> tasks)
     -> detail::when_all_ready_awaitable<std::vector<detail::when_all_task<void>>>
 {
     std::vector<detail::when_all_task<void>> output_tasks;
 
     // If the size is known in constant time reserve the output tasks size.
-    output_tasks.reserve(std::size(awaitables));
+    output_tasks.reserve(std::size(tasks));
 
     // Wrap each task into a when_all_task.
-    for (auto& a : awaitables)
+    for (auto& task : tasks)
     {
-        output_tasks.emplace_back(detail::make_when_all_task(std::move(a)));
+        output_tasks.emplace_back(detail::make_when_all_task(task));
     }
 
     // Return the single awaitable that drives all the user's tasks.
@@ -473,10 +495,11 @@ template<concepts::awaitable... awaitables_type>
 } // namespace coro
 
 inline auto abstract_task_node::schedule() -> coro::task<> {
-    std::vector<std::reference_wrapper<coro::task<>>> tasks;
+    std::println("scheduling {}", task_name());
+    std::vector<coro::task<>> tasks;
     for (auto& predecessor: predecessors()) {
-        tasks.emplace_back(predecessor->task());
+        tasks.emplace_back(predecessor->schedule());
     }
     co_await coro::when_all(tasks);
-    co_await task();
+    co_await try_schedule_self();
 }

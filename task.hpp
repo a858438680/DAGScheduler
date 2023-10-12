@@ -10,10 +10,6 @@
 
 namespace coro {
 
-struct scheduler_t;
-
-struct dag_scheduler;
-
 template <typename return_type = void>
 class task;
 
@@ -44,15 +40,10 @@ struct promise_base {
     auto final_suspend() noexcept { return final_awaitable{}; }
     auto unhandled_exception() noexcept -> void { m_exception_ptr = std::current_exception(); }
     auto set_continuation(std::coroutine_handle<> continuation) noexcept { m_continuation = continuation; }
-    auto set_scheduler(dag_scheduler& scheduler) noexcept -> void;
-
-    auto await_transform(concepts::awaitable auto&& a) -> decltype(auto) { return std::forward<decltype(a)>(a); }
-    auto await_transform(scheduler_t) noexcept;
 
 protected:
     std::coroutine_handle<> m_continuation;
     std::exception_ptr m_exception_ptr;
-    dag_scheduler* m_scheduler;
 };
 
 template <typename return_type>
