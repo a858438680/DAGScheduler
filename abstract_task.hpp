@@ -27,7 +27,8 @@ private:
     std::atomic<void*> m_awaiting_list{nullptr};
 
     struct schedule_awaitable {
-        auto await_ready() const noexcept -> bool { return false; }
+        // if the task is already marked completed, do not suspend the coroutine.
+        auto await_ready() const noexcept -> bool { return self_.m_state.load(std::memory_order_acquire) == node_state::completed; }
         auto await_suspend(std::coroutine_handle<> awaiting_coroutine) -> bool {
             // check whether the task is already scheduled
             auto expected = node_state::init;
@@ -147,7 +148,9 @@ private:
     };
 
     auto on_schedule() -> schedule_task {
+        m_state.store(node_state::running, std::memory_order_relaxed);
         co_await task();
+        m_state.store(node_state::completed, std::memory_order_release);
     }
 };
 
