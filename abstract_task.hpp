@@ -5,8 +5,8 @@
 #include <string>
 #include <span>
 #include <vector>
-#include <print>
-#include "task.hpp"
+#include <fmt/core.h>
+#include <coro/task.hpp>
 
 struct abstract_task_node {
     virtual auto task_name() -> std::string = 0;
@@ -67,8 +67,8 @@ private:
         auto await_resume() noexcept -> void {}
 
         abstract_task_node& self_;
-        std::coroutine_handle<> m_awaiting_coroutine;
-        schedule_awaitable* m_next;
+        std::coroutine_handle<> m_awaiting_coroutine{nullptr};
+        schedule_awaitable* m_next{nullptr};
     };
 
     auto try_schedule_self() -> schedule_awaitable {
@@ -138,7 +138,6 @@ private:
         }
 
         auto start() -> void {
-            auto& promise = m_coroutine.promise();
             if (m_coroutine != nullptr) {
                 m_coroutine.resume();
             }
@@ -495,7 +494,7 @@ inline auto make_when_all_task(task<>& awaitable) -> when_all_task<void>
 } // namespace coro
 
 inline auto abstract_task_node::schedule() -> coro::task<> {
-    std::println("scheduling {}", task_name());
+    fmt::println("scheduling {}", task_name());
     std::vector<coro::task<>> tasks;
     for (auto& predecessor: predecessors()) {
         tasks.emplace_back(predecessor->schedule());
